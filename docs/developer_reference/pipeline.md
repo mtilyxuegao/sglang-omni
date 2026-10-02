@@ -120,6 +120,11 @@ different sessions. With `BatchedSessionHooks`, `append_batch` runs the
 earliest ready unit of every ready session in one call; that one hook call
 replaces the concurrent workers.
 
+If a session's append fails, the stage ends that session and the other
+sessions continue. Each session has a state budget,
+`max_state_bytes_per_session`, checked after every append; a session over it
+is ended the same way.
+
 #### Code2WavScheduler
 
 `Code2WavScheduler` is a streaming vocoder scheduler. It handles:

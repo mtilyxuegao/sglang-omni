@@ -509,6 +509,10 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                             )
                             self.check_usage(session_identity)
                             return updated_payload
+                        except BaseException:
+                            # note (Junnan Li): A later unit of this session may already be queued; closing keeps it off the state this unit left behind.
+                            self.close_session(session_identity, session)
+                            raise
                         finally:
                             with self.session_table_lock:
                                 self.append_cancel_events.pop(payload.request_id, None)
@@ -555,6 +559,13 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
         """Run one unit of each of several distinct sessions in one hook call."""
         results: dict[str, StagePayload | Exception] = {}
         started: list[SessionAppend] = []
+        started_sessions: list[StageSession] = []
+
+        def fail(append: SessionAppend, session: StageSession, exc: Exception) -> None:
+            # note (Junnan Li): A later unit of this session may already be queued; closing keeps it off the state this unit left behind.
+            self.close_session(append.context.session_identity, session)
+            results[append.payload.request_id] = exc
+
         try:
             with ExitStack() as held_locks:
                 for payload, session_operation in appends:
@@ -576,16 +587,24 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                             started.append(
                                 self.start_append(payload, session_operation)
                             )
+                            started_sessions.append(session)
                 if started:
-                    updated_payloads = self.session_hooks.append_batch(started)
-                    for append, updated_payload in zip(
-                        started, updated_payloads, strict=True
-                    ):
-                        try:
-                            self.check_usage(append.context.session_identity)
-                            results[append.payload.request_id] = updated_payload
-                        except Exception as exc:
-                            results[append.payload.request_id] = exc
+                    try:
+                        updated_payloads = self.session_hooks.append_batch(started)
+                    except Exception as exc:
+                        for append, session in zip(
+                            started, started_sessions, strict=True
+                        ):
+                            fail(append, session, exc)
+                    else:
+                        for append, session, updated_payload in zip(
+                            started, started_sessions, updated_payloads, strict=True
+                        ):
+                            try:
+                                self.check_usage(append.context.session_identity)
+                                results[append.payload.request_id] = updated_payload
+                            except Exception as exc:
+                                fail(append, session, exc)
                 else:
                     pass
         except Exception as exc:

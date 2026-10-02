@@ -198,14 +198,16 @@ def test_session_over_its_state_budget_fails_only_its_own_unit():
             message("a0", "append", "a", 0),
             message("b0", "append", "b", 0),
             message("a1", "append", "a", 1),
+            message("b1", "append", "b", 1),
         ],
     )
     assert hooks.calls == [["a0", "b0"], ["a1"]]
     assert isinstance(outputs["b0"].data, QueueFullError)
+    assert outputs["b1"].type == "error"
     assert outputs["a0"].type == outputs["a1"].type == "result"
 
 
-def test_failed_batch_fails_only_its_units():
+def test_failed_batch_ends_only_its_sessions():
     hooks = RecordingHooks(fail_batch=True)
     scheduler = SessionScheduler(hooks)
     outputs = run_backlog(
@@ -221,7 +223,9 @@ def test_failed_batch_fails_only_its_units():
     assert outputs["a0"].type == outputs["b0"].type == "error"
     assert isinstance(outputs["a0"].data, RuntimeError)
     assert outputs["open-c"].type == "result"
-    assert outputs["a1"].type == "result"
+    # note (Junnan Li): a1 was queued behind the failed a0, so it must not run on a's state.
+    assert outputs["a1"].type == "error"
+    assert hooks.calls == [["a0", "b0"]]
 
 
 def test_aborted_unit_leaves_the_batch_without_blocking_its_session():
