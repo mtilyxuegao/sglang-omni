@@ -20,7 +20,7 @@ Two configs are provided:
 | Config | Use it for |
 |---|---|
 | `minicpmo.yaml` | Normal serving; replies are sampled the way the MiniCPM-o demo samples them |
-| `minicpmo-parity.yaml` | Repeatable output for regression and parity recordings; it differs only in greedy sampling and `top_k: 100` |
+| `minicpmo-parity.yaml` | Repeatable output for regression and parity recordings; it differs in greedy sampling, `top_k: 100`, and running the thinker and talker without CUDA graphs |
 
 Settings you may want to change in the config:
 
@@ -32,6 +32,7 @@ Settings you may want to change in the config:
 | `speech.dtype` | `float32` | Precision of the voice decoder's flow model: `float32`, `float16` or `bfloat16`; the lower precisions change the voice slightly |
 | `speech.enable_dit_torch_compile` | `false` | Compile the voice decoder's flow model with `torch.compile` while the server starts; CUDA only |
 | `speech.n_timesteps` | 10 | Flow-matching steps per audio chunk; fewer steps decode faster at some cost in voice quality |
+| `stages.thinker/talker.engine.enable_torch_compile` | `false` | Compiles every decode graph batch size; adds minutes to startup |
 | `sampling.*` | see file | Default sampling for sessions that do not set their own |
 | `vision.*` | see file | Limits on camera frames per unit (1 s of audio) |
 
