@@ -240,7 +240,7 @@ These are set in `examples/full_duplex/minicpmo.yaml`:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `max_sessions` | 2 | Conversations served at the same time. Startup warms up perception at each batch size up to this value |
+| `max_sessions` | 2 | Conversations served at the same time; the thinker and talker reserve GPU memory for this many full-length conversations, so raise it only as far as the GPU has room. Startup warms up perception at each batch size up to this value |
 | `reference_audio` | checkpoint default | Voice used when a session sends no reference |
 | `speech_state_bytes_per_session` | 2 GiB | Memory the speech stage may hold per conversation; a conversation that needs more is closed and the others keep running |
 | `speech.dtype` | `float32` | Precision of the voice decoder's flow model: `float32`, `float16` or `bfloat16`; the lower precisions change the voice slightly |
