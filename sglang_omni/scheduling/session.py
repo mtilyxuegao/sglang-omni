@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
+import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
@@ -107,7 +108,13 @@ class SessionAppend:
 
 
 class BatchedSessionHooks(SessionHooks):
-    """Hooks that run one unit of each of several sessions in one call."""
+    """Hooks that run one unit of each ready session in one call.
+
+    gather_window_ms is how long an idle stage waits for more appends when
+    fewer sessions are ready than open; 0 runs with what is ready.
+    """
+
+    gather_window_ms: float = 0.0
 
     def append_batch(self, appends: list[SessionAppend]) -> list[StagePayload]:
         """Run one unit for each of several distinct sessions, in order."""
@@ -186,9 +193,12 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
             batch_compute_fn = self.compute_batch
             max_batch_size = max_open_sessions
             max_concurrency = 1
+            gather_window_seconds = session_hooks.gather_window_ms / 1000
         else:
             batch_compute_fn = None
             max_batch_size = 1
+            # note (Junnan Li): Each call runs one operation, so there is nothing to gather.
+            gather_window_seconds = 0.0
         super().__init__(
             self.compute,
             batch_compute_fn=batch_compute_fn,
@@ -198,6 +208,9 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
             shutdown_callback=self.release_sessions_on_scheduler_stop,
         )
         self.inbox = SessionInbox(self.register_operation)
+        self.gather_window_seconds = gather_window_seconds
+        # note (Junnan Li): Operations that arrived while the previous call ran are batched as they are; only a call that starts from an idle stage waits.
+        self.is_backlogged = False
 
     def register_operation(self, message: IncomingMessage) -> None:
         try:
@@ -320,7 +333,10 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
             for index, message in enumerate(batch)
             if index == 0 or not self.consume_if_aborted(message.request_id)
         ]
-        results = self.compute_batch([message.data for message in batch])
+        try:
+            results = self.compute_batch([message.data for message in batch])
+        finally:
+            self.is_backlogged = not self.inbox.empty()
         for message, result in zip(batch, results, strict=True):
             if self.consume_if_aborted(message.request_id):
                 continue
@@ -328,6 +344,53 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                 self.emit_error(message.request_id, result, self.outbox)
             else:
                 self.emit_result(message.request_id, result, self.outbox)
+
+    def collect_batch(self, first_msg: IncomingMessage) -> list[IncomingMessage]:
+        """Take every ready operation; from an idle stage, wait up to the hooks' gather window for more appends.
+
+        The wait ends at the window, once the batch holds an append of every
+        open session, or when an operation other than an append is in the
+        batch. Messages keep their inbox order, so the cursor contract above
+        is untouched.
+        """
+        batch = super().collect_batch(first_msg)
+        if self.gather_window_seconds == 0 or self.is_backlogged:
+            return batch
+        else:
+            pass
+        deadline = time.monotonic() + self.gather_window_seconds
+        while len(batch) < self.max_batch_size:
+            with self.session_table_lock:
+                arrivals = [
+                    self.arrivals_by_request_id.get(message.request_id)
+                    for message in batch
+                ]
+                open_session_count = len(self.open_sessions)
+            if any(
+                arrival is None or arrival.operation != "append" for arrival in arrivals
+            ):
+                break
+            elif (
+                len({arrival.session_identity for arrival in arrivals})
+                >= open_session_count
+            ):
+                break
+            else:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            else:
+                pass
+            try:
+                message = self.inbox.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if message.type == "new_request":
+                batch.append(message)
+            else:
+                self.pending_messages.append(message)
+        return batch
 
     def compute_batch(
         self, payloads: list[StagePayload]

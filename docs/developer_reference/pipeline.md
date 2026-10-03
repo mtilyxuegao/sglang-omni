@@ -118,7 +118,9 @@ session, so a session's operations run in arrival order.
 With `SessionHooks`, each call runs one unit and concurrent workers serve
 different sessions. With `BatchedSessionHooks`, `append_batch` runs the
 earliest ready unit of every ready session in one call; that one hook call
-replaces the concurrent workers.
+replaces the concurrent workers. When fewer sessions are ready than open, an
+idle stage waits up to `gather_window_ms` for more appends; each stage derives
+that window from its own per-call floor, and 0 runs with what is ready.
 
 If a session's append fails, the stage ends that session and the other
 sessions continue. Each session has a state budget,
