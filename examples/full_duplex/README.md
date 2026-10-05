@@ -26,7 +26,7 @@ Settings you may want to change in the config:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `max_sessions` | 2 | Conversations served at the same time |
+| `max_sessions` | 2 | Conversations served at the same time. Startup warms up perception at each batch size up to this value |
 | `reference_audio` | checkpoint default | Voice used when a session sends no reference |
 | `speech_state_bytes_per_session` | 2 GiB | Memory the speech stage may hold per conversation; a conversation that needs more is closed and the others keep running |
 | `sampling.*` | see file | Default sampling for sessions that do not set their own |
