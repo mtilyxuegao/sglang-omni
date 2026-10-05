@@ -249,6 +249,8 @@ These are set in `examples/full_duplex/minicpmo.yaml`:
 | `vision.max_frames_per_unit` | 4 | Frames accepted per unit (1 s of audio) |
 | `vision.max_slice_nums_limit` | 9 | Highest slice count a session may request |
 
+While the server starts, the speech stage records the voice decoder as CUDA graphs for up to 8 conversations decoded together, or `max_sessions` if lower; the graphs hold GPU memory and add to startup time, and a voice whose reference audio is longer than the default voice's is decoded without them.
+
 One conversation can hold 8192 tokens of history, which is the model's limit. When a conversation fills it, the server sends a `context_exhausted` error and closes the session. Start a new session to continue.
 
-For repeatable output, start the server from `examples/full_duplex/minicpmo-parity.yaml`, which uses greedy sampling and runs without CUDA graphs.
+For repeatable output, start the server from `examples/full_duplex/minicpmo-parity.yaml`, which uses greedy sampling and runs the thinker and talker without CUDA graphs.
