@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict
 
-from benchmarks.duplex.client import SEND_RECEIPTS_FILE
+from benchmarks.duplex.client import PACKET_MS, SEND_RECEIPTS_FILE
 from benchmarks.duplex.minicpmo_trials import SpokenEvent, TrialInput
 from benchmarks.duplex.oracle_models import TraceRecord, WireEvent
 from benchmarks.duplex.profiles import PROFILES, ProfileName
@@ -24,7 +25,7 @@ UNIT_DURATION_S = PROFILES[PROFILE].native_unit_ms / 1000
 OUTPUT_SAMPLE_RATE = PROFILES[PROFILE].output_sample_rate
 PCM16_BYTES = 2
 COUNT_TARGET = 30
-# note (Jisen Li): #2895 counts a stop as working when the reply ends within about 3 s.
+# note (Jisen Li): #2895 reads a stop as working when the reply ends within about 3 s; the window starts when the stop's unit ends, so every offset gets the same time to react.
 STOP_WITHIN_S = 3.0
 # note (Jisen Li): A count past twenty when the stop arrives ends on its own about as soon as a stop would end it.
 MAX_COUNT_AT_STOP = 20
@@ -46,7 +47,7 @@ StopStatus = Literal[
 
 class OfficialUnit(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    unit: int
+    unit_index: int
     is_listen: bool
     text: str
     end_of_turn: bool
@@ -64,10 +65,9 @@ class AudioArrival(NamedTuple):
 
 @dataclass(frozen=True, kw_only=True)
 class Reply:
-    """A reply's speaking units on the input clock, and when its audio reached the client."""
+    """A reply's speaking units on the input clock, and when its last audio finished arriving at the client."""
 
     units: tuple[ReplyUnit, ...]
-    first_audio_s: float | None = None
     audio_end_s: float | None = None
 
 
@@ -75,7 +75,7 @@ class Reply:
 class StopScore:
     status: StopStatus
     counted_to_thirty: bool
-    reply_end_after_stop_s: float | None = None
+    reply_end_after_stop_unit_s: float | None = None
     delivered_end_after_stop_s: float | None = None
 
 
@@ -134,7 +134,6 @@ def sglang_replies(run_dir: Path) -> list[Reply]:
                 units=tuple(
                     ReplyUnit(*unit) for unit in sorted(texts_by_unit_start_s.items())
                 ),
-                first_audio_s=audio_arrivals[0].arrival_s if audio_arrivals else None,
                 audio_end_s=(
                     audio_arrivals[-1].arrival_s + audio_arrivals[-1].audio_s
                     if audio_arrivals
@@ -148,19 +147,24 @@ def sglang_replies(run_dir: Path) -> list[Reply]:
 def official_replies(log_path: Path) -> list[Reply]:
     """Replies of one official-loop log, split as the session splits responses.
 
-    A speaking unit opens a reply or joins the open one, a listen unit leaves it open, and an end of turn closes it.
+    A speaking unit with text opens a reply, any speaking unit joins the open one, a listen unit leaves it open, and an end of turn closes it.
     """
     replies: list[list[ReplyUnit]] = []
     is_reply_open = False
     for line in log_path.read_text().splitlines():
         unit = OfficialUnit.model_validate_json(line)
+        unit_start_s = unit.unit_index * UNIT_DURATION_S
         if unit.is_listen:
             pass
         elif is_reply_open:
-            replies[-1].append(ReplyUnit(unit.unit * UNIT_DURATION_S, unit.text))
+            replies[-1].append(ReplyUnit(unit_start_s, unit.text))
+        elif unit.text:
+            replies.append([ReplyUnit(unit_start_s, unit.text)])
         else:
-            replies.append([ReplyUnit(unit.unit * UNIT_DURATION_S, unit.text)])
-        is_reply_open = (is_reply_open or not unit.is_listen) and not unit.end_of_turn
+            pass
+        is_reply_open = (
+            is_reply_open or (not unit.is_listen and bool(unit.text))
+        ) and not unit.end_of_turn
     return [Reply(units=tuple(units)) for units in replies]
 
 
@@ -176,7 +180,7 @@ def counted_to(transcript: str) -> int:
     while index < len(tokens):
         token = tokens[index]
         next_token = tokens[index + 1] if index + 1 < len(tokens) else ""
-        ones = NUMBER_WORDS.get(next_token, 0)
+        ones_value = NUMBER_WORDS.get(next_token, 0)
         # note (Jisen Li): Deltas can split "10" into "1 0", and "twenty-six" can come as "twenty six"; a pair is joined only when that continues the count.
         if (
             token.isdigit()
@@ -184,8 +188,8 @@ def counted_to(transcript: str) -> int:
             and int(token + next_token) == count + 1
         ) or (
             token in TENS_WORDS
-            and 0 < ones < 10
-            and TENS_WORDS[token] + ones == count + 1
+            and 0 < ones_value < 10
+            and TENS_WORDS[token] + ones_value == count + 1
         ):
             count += 1
             index += 2
@@ -201,7 +205,7 @@ def counted_to(transcript: str) -> int:
 
 
 def score_stop(stop_s: float | None, replies: list[Reply]) -> StopScore:
-    """Score the counting reply, the first that counts at least to one, against a stop spoken at stop_s, or without one."""
+    """Score the counting reply, the first that counts at least to one, against a stop whose onset is at stop_s, or without one."""
     counting_reply = next(
         (reply for reply in replies if counted_to(reply_transcript(reply)) > 0),
         None,
@@ -217,6 +221,7 @@ def score_stop(stop_s: float | None, replies: list[Reply]) -> StopScore:
         pass
     reply_start_s = counting_reply.units[0].start_s
     reply_end_s = counting_reply.units[-1].start_s + UNIT_DURATION_S
+    stop_unit_end_s = (math.floor(stop_s / UNIT_DURATION_S) + 1) * UNIT_DURATION_S
     count_at_stop = counted_to(
         "".join(unit.text for unit in counting_reply.units if unit.start_s < stop_s)
     )
@@ -231,7 +236,7 @@ def score_stop(stop_s: float | None, replies: list[Reply]) -> StopScore:
     return StopScore(
         status=status,
         counted_to_thirty=counted_to_thirty,
-        reply_end_after_stop_s=reply_end_s - stop_s,
+        reply_end_after_stop_unit_s=reply_end_s - stop_unit_end_s,
         delivered_end_after_stop_s=(
             counting_reply.audio_end_s - stop_s
             if counting_reply.audio_end_s is not None
@@ -279,7 +284,8 @@ def stop_table(
     trial_inputs: list[TrialInput], replies_by_trial: dict[str, list[list[Reply]]]
 ) -> str:
     rows = [
-        "| Trial | Kept | Excluded | Stopped within 3 s | Counted to 30 | Reply end after stop p50 / p90 / max (s) | Delivered audio end after stop p50 / p90 / max (s) |",
+        f"| Trial | Kept | Excluded | Stopped within {STOP_WITHIN_S:g} s of the stop's unit | Counted to {COUNT_TARGET} | "
+        "Reply end after the stop's unit p50 / p90 / max (s) | Delivered audio end after the stop p50 / p90 / max (s) |",
         "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for trial_input in trial_inputs:
@@ -292,10 +298,10 @@ def stop_table(
             )
             stop_scores = [score_stop(stop_s, replies) for replies in runs]
             kept_scores = [score for score in stop_scores if score.status == "kept"]
-            reply_ends_after_stop_s = [
-                score.reply_end_after_stop_s
+            reply_ends_after_stop_unit_s = [
+                score.reply_end_after_stop_unit_s
                 for score in kept_scores
-                if score.reply_end_after_stop_s is not None
+                if score.reply_end_after_stop_unit_s is not None
             ]
             delivered_ends_after_stop_s = [
                 score.delivered_end_after_stop_s
@@ -304,7 +310,10 @@ def stop_table(
             ]
             stopped = (
                 str(
-                    sum(seconds <= STOP_WITHIN_S for seconds in reply_ends_after_stop_s)
+                    sum(
+                        seconds <= STOP_WITHIN_S
+                        for seconds in reply_ends_after_stop_unit_s
+                    )
                 )
                 if stop_s is not None
                 else ""
@@ -312,7 +321,7 @@ def stop_table(
             rows.append(
                 f"| {trial_input.name} | {len(kept_scores)} | {len(stop_scores) - len(kept_scores)} | {stopped} | "
                 f"{sum(score.counted_to_thirty for score in kept_scores)} | "
-                f"{format_quantiles(reply_ends_after_stop_s)} | {format_quantiles(delivered_ends_after_stop_s)} |"
+                f"{format_quantiles(reply_ends_after_stop_unit_s)} | {format_quantiles(delivered_ends_after_stop_s)} |"
             )
         else:
             pass
@@ -373,9 +382,10 @@ def greeting_table(
 
 
 def serving_table(run_dirs: list[Path], playback_reserve_s: float) -> str:
-    """Unit lag and first-audio latency pooled over sessions that kept the protocol, as benchmarks.duplex.serving scores one session."""
+    """Unit lag and first-audio latency as benchmarks.duplex.serving scores a session, and how far each packet send strayed from its schedule."""
     unit_lags_s: list[float] = []
     first_audio_latencies_s: list[float] = []
+    send_deviations_ms: list[float] = []
     units_missed = 0
     for run_dir in run_dirs:
         session_score = score_session(run_dir, PROFILE, playback_reserve_s)
@@ -383,6 +393,16 @@ def serving_table(run_dirs: list[Path], playback_reserve_s: float) -> str:
         units_missed += session_score["units_missed"]
         first_audio_latencies_s += [
             reply["first_audio_latency_s"] for reply in session_score["replies"]
+        ]
+        appends = json.loads((run_dir / SEND_RECEIPTS_FILE).read_text())["appends"]
+        send_deviations_ms += [
+            abs(
+                append["start_s"]
+                - appends[0]["start_s"]
+                - append["seq"] * PACKET_MS / 1000
+            )
+            * 1000
+            for append in appends
         ]
     if unit_lags_s:
         unit_lag_quantiles = quantiles(unit_lags_s)
@@ -400,10 +420,17 @@ def serving_table(run_dirs: list[Path], playback_reserve_s: float) -> str:
         )
     else:
         first_audio_latency_column = ""
+    if send_deviations_ms:
+        send_deviation_quantiles = quantiles(send_deviations_ms)
+        send_deviation_column = f"{send_deviation_quantiles['p99']:.1f} / {send_deviation_quantiles['max']:.1f}"
+    else:
+        send_deviation_column = ""
     return "\n".join(
         [
-            "| Sessions | Units | Units missed | Unit lag p50 / p90 / p99 / max (s) | First audio latency p50 / p90 / max (s) |",
-            "| --- | --- | --- | --- | --- |",
-            f"| {len(run_dirs)} | {len(unit_lags_s)} | {units_missed} | {unit_lag_column} | {first_audio_latency_column} |",
+            "| Sessions | Units | Units missed | Unit lag p50 / p90 / p99 / max (s) | First audio latency p50 / p90 / max (s) | "
+            f"Packets | Send deviation from the {PACKET_MS} ms schedule p99 / max (ms) |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+            f"| {len(run_dirs)} | {len(unit_lags_s)} | {units_missed} | {unit_lag_column} | {first_audio_latency_column} | "
+            f"{len(send_deviations_ms)} | {send_deviation_column} |",
         ]
     )

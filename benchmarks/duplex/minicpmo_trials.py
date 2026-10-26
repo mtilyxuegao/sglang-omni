@@ -17,12 +17,13 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter
 from benchmarks.duplex.client import SAMPLE_RATE
 
 TRIALS_FILE = "trials.json"
+CLIPS_DIR = Path(__file__).parent / "assets" / "minicpmo_baseline_clips"
 PCM16_MIN = -32768
 PCM16_MAX = 32767
 NOISE_SEED = 0
 STOP_TRIAL_S = 30.0
 COUNT_QUESTION_S = 1.0
-# note (Jisen Li): The counting reply starts with unit 3, so a stop in unit 7 lands about 3 s into it.
+# note (Jisen Li): The counting reply's audio starts when unit 3 ends, so a stop in unit 7 lands about 3 s into what is heard.
 STOP_UNIT_START_S = 7.0
 STOP_OFFSETS_MS = (0, 250, 500, 750)
 GREETING_TRIAL_S = 32.0
@@ -40,7 +41,7 @@ EventRole = Literal["prompt", "stop", "greeting", "question"]
 
 @dataclass(frozen=True, kw_only=True)
 class Placement:
-    clip: str
+    clip_name: str
     start_s: float
     role: EventRole
     gain: float = 1.0
@@ -82,10 +83,14 @@ def greeting_trial(
     noise_dbfs: float | None = None,
 ) -> Trial:
     greetings = tuple(
-        Placement(clip=greeting, start_s=start_s, role="greeting", gain=greeting_gain)
+        Placement(
+            clip_name=greeting, start_s=start_s, role="greeting", gain=greeting_gain
+        )
         for start_s in greetings_s
     )
-    question = Placement(clip="capital_question", start_s=question_s, role="question")
+    question = Placement(
+        clip_name="capital_question", start_s=question_s, role="question"
+    )
     return Trial(
         name=name,
         duration_s=GREETING_TRIAL_S,
@@ -102,7 +107,7 @@ def quiet_question_trial(name: str, *, gain: float, noise_dbfs: float | None) ->
         duration_s=GREETING_TRIAL_S,
         placements=(
             Placement(
-                clip="capital_question",
+                clip_name="capital_question",
                 start_s=QUIET_QUESTION_S,
                 role="question",
                 gain=gain,
@@ -113,7 +118,7 @@ def quiet_question_trial(name: str, *, gain: float, noise_dbfs: float | None) ->
 
 
 COUNT_QUESTION = Placement(
-    clip="count_question", start_s=COUNT_QUESTION_S, role="prompt"
+    clip_name="count_question", start_s=COUNT_QUESTION_S, role="prompt"
 )
 TRIALS = (
     Trial(name="control", duration_s=STOP_TRIAL_S, placements=(COUNT_QUESTION,)),
@@ -124,7 +129,7 @@ TRIALS = (
             placements=(
                 COUNT_QUESTION,
                 Placement(
-                    clip=f"stop_{stop_length}",
+                    clip_name=f"stop_{stop_length}",
                     start_s=STOP_UNIT_START_S + offset_ms / 1000,
                     role="stop",
                 ),
@@ -175,12 +180,14 @@ TRIALS = (
     ),
 )
 CLIPS = tuple(
-    dict.fromkeys(placement.clip for trial in TRIALS for placement in trial.placements)
+    dict.fromkeys(
+        placement.clip_name for trial in TRIALS for placement in trial.placements
+    )
 )
 
 
 def compose_trial(
-    trial: Trial, clips: dict[str, npt.NDArray[np.int16]]
+    trial: Trial, clip_samples_by_name: dict[str, npt.NDArray[np.int16]]
 ) -> npt.NDArray[np.int16]:
     """PCM16 input: seeded white noise, then every clip added at its start with its gain."""
     sample_count = round(trial.duration_s * SAMPLE_RATE)
@@ -197,12 +204,12 @@ def compose_trial(
     else:
         samples = np.zeros(sample_count)
     for placement in trial.placements:
-        clip_samples = clips[placement.clip]
+        clip_samples = clip_samples_by_name[placement.clip_name]
         start_sample = round(placement.start_s * SAMPLE_RATE)
         end_sample = start_sample + len(clip_samples)
         if end_sample > sample_count:
             raise ValueError(
-                f"{placement.clip} at {placement.start_s} s runs past the end of {trial.name}"
+                f"{placement.clip_name} at {placement.start_s} s runs past the end of {trial.name}"
             )
         else:
             samples[start_sample:end_sample] = np.clip(
@@ -217,9 +224,9 @@ def compose_trial(
 
 def write_inputs(clips_dir: Path, inputs_dir: Path) -> list[TrialInput]:
     """Write every trial's input WAV and the trial list that record and report read."""
-    clips: dict[str, npt.NDArray[np.int16]] = {}
-    for clip in CLIPS:
-        clip_path = clips_dir / f"{clip}.wav"
+    clip_samples_by_name: dict[str, npt.NDArray[np.int16]] = {}
+    for clip_name in CLIPS:
+        clip_path = clips_dir / f"{clip_name}.wav"
         clip_format = soundfile.info(str(clip_path))
         if (clip_format.samplerate, clip_format.channels, clip_format.subtype) != (
             SAMPLE_RATE,
@@ -229,7 +236,7 @@ def write_inputs(clips_dir: Path, inputs_dir: Path) -> list[TrialInput]:
             raise ValueError(f"{clip_path} must be PCM16 mono at {SAMPLE_RATE} Hz")
         else:
             clip_samples, _ = soundfile.read(str(clip_path), dtype="int16")
-            clips[clip] = clip_samples
+            clip_samples_by_name[clip_name] = clip_samples
     trial_inputs: list[TrialInput] = []
     trial_samples: list[npt.NDArray[np.int16]] = []
     for trial in TRIALS:
@@ -237,7 +244,8 @@ def write_inputs(clips_dir: Path, inputs_dir: Path) -> list[TrialInput]:
             SpokenEvent(
                 role=placement.role,
                 start_s=placement.start_s,
-                end_s=placement.start_s + len(clips[placement.clip]) / SAMPLE_RATE,
+                end_s=placement.start_s
+                + len(clip_samples_by_name[placement.clip_name]) / SAMPLE_RATE,
             )
             for placement in trial.placements
         ]
@@ -248,7 +256,7 @@ def write_inputs(clips_dir: Path, inputs_dir: Path) -> list[TrialInput]:
                 )
             else:
                 pass
-        samples = compose_trial(trial, clips)
+        samples = compose_trial(trial, clip_samples_by_name)
         trial_samples.append(samples)
         trial_inputs.append(
             TrialInput(
