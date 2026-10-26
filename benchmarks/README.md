@@ -208,6 +208,8 @@ python -m benchmarks.eval.benchmark_omni_seedtts \
 | `eval/benchmark_duplex.py` | Native full-duplex VoiceChat continuous protocol case | Nemotron VoiceChat | `/v1/realtime` (native) |
 | `eval/benchmark_duplex_v15.py` | Full-Duplex-Bench v1.5 paired overlap sessions, event timing and judged behavior | Nemotron VoiceChat | `/v1/realtime` (native) |
 | `eval/benchmark_duplex_v10.py` | Full-Duplex-Bench v1.0 pause, turn-taking, interruption and backchannel takeover/latency | Nemotron VoiceChat | `/v1/realtime` (native) |
+| `eval/benchmark_minicpmo_baselines.py` | Spoken stop and greeting trials with unit-clock scores and serving timing | MiniCPM-o | `/v1/realtime` (native) |
+| `eval/benchmark_minicpmo_official_loop.py` | The same trials through the checkpoint's own duplex loop, text only | MiniCPM-o | none (in-process) |
 
 See [tts_serving/README.md](tts_serving/README.md) for the TTS serving
 benchmark design, harness contract, scenario matrix, and Docker usage.
@@ -652,6 +654,48 @@ and `unified-score` for the metrics in
 The [runbook](../docs/developer_reference/full_duplex_bench.md) runs all of them.
 
 Both `*_seedtts.py` scripts also support speech quality and similarity evaluation via UTMOS and WavLM speaker verification metrics. Running with `--utmos-only` or `--similarity-only` loads the respective pre-trained predictor and computes scores on the previously generated audio in the output directory without requiring the TTS/ASR servers to be running.
+
+## MiniCPM-o interaction baselines
+
+`benchmark_minicpmo_baselines.py` records the spoken stop and greeting trials behind #2895 and #2896 against a native MiniCPM-o session. `benchmark_minicpmo_official_loop.py` feeds the same inputs to the checkpoint's own MiniCPMODuplex loop, so a gap can be placed on serving or on the model.
+
+The trials are built from six trimmed PCM16 mono 16 kHz clips in one directory: `count_question.wav` ("Please count slowly from one to thirty."), `stop_short.wav` ("Stop!"), `stop_long.wav` ("Stop, stop, please stop talking."), `hi.wav` ("Hi."), `hello.wav` ("Hello?") and `capital_question.wav` ("What is the capital of Australia?"). A clip's end is taken as the end of its speech, so trim trailing silence. `inputs` refuses clips that overlap the next one or run past the trial. Keep the clips fixed across the runs you compare.
+
+- Stop trials ask the count question at 1 s and put a stop clip at 7 s plus 0, 250, 500 or 750 ms, about 3 s into the counting reply and at a fixed offset into its one-second unit. `control` has no stop.
+- Cold greeting trials say a greeting at 2, 10 and 16 s and ask a normal-volume question at 23 s. Ongoing ones ask the question at 1 s and greet at 12, 18 and 24 s. Quiet-question trials hold only a quiet question at 10 s.
+- Soft clips are 20 dB down and softer ones about 30 dB down. `noisy_` trials add seeded white noise at -50 dBFS under everything.
+
+```bash
+python -m benchmarks.eval.benchmark_minicpmo_baselines inputs \
+    --clips clips --output results/minicpmo-baselines/inputs
+python -m benchmarks.eval.benchmark_minicpmo_baselines record \
+    --inputs results/minicpmo-baselines/inputs \
+    --url ws://127.0.0.1:8000/v1/realtime \
+    --server-revision "$SERVER_REVISION" \
+    --model openbmb/MiniCPM-o-4_5 --model-revision "$MODEL_REVISION" \
+    --output results/minicpmo-baselines/runs --rounds 5
+python -m benchmarks.eval.benchmark_minicpmo_baselines report \
+    --inputs results/minicpmo-baselines/inputs --runs results/minicpmo-baselines/runs
+```
+
+`record` runs every trial once per round, one session at a time, so drift spreads over all trials. Each run is a `benchmark_duplex.py` run directory, including the per-packet send receipts. A run that fails the protocol check is renamed to `<run>.failed-<n>` and recorded again on the next call; finished runs are kept, so a stopped recording resumes. It refuses inputs that no longer match `trials.json` and kept runs recorded from other inputs.
+
+The official loop needs its own environment with `transformers==4.51.0`, `torch<=2.8.0`, `librosa` and `minicpmo-utils[all]`. It feeds 1,000 ms chunks and lets the loop front-pad the first to 1,035 ms, as the session does, so both cut units at the same input times. `--configuration official` keeps the loop's defaults (top_k 100, no forced listening). `matched` takes the session defaults (top_k 20, the first three units forced to listen). Both use temperature 0.7, top_p 0.8 and the system prompt "Streaming Omni Conversation." with the checkpoint's reference voice. The output directory records its configuration and the inputs it ran, and refuses others.
+
+```bash
+python -m benchmarks.eval.benchmark_minicpmo_official_loop \
+    --model-path "$MODEL_DIR" --inputs results/minicpmo-baselines/inputs \
+    --output results/minicpmo-baselines/official-matched --configuration matched
+python -m benchmarks.eval.benchmark_minicpmo_baselines report \
+    --inputs results/minicpmo-baselines/inputs \
+    --official results/minicpmo-baselines/official-matched
+```
+
+Scores use the input unit clock: unit k covers k to k + 1 s of input, and a reply ends at the end of its last speaking unit. Official-loop logs are split into replies as the session splits responses: a reply stays open through listen units until an end of turn.
+
+- A stop trial scores the first reply that counts at least to one; a reply stopped right after a preamble may have counted only "One". It counts as stopped when that reply ends within 3 s of the stop's onset. Excluded are runs with no counting reply, a reply that started after the stop or ended before it, and a count already past twenty at the stop.
+- A spoken event is answered when a reply's first unit ends after the event starts and begins within 4 s of its end. Each reply answers at most one event.
+- The serving table pools unit lag and first-audio latency over the sessions that passed the protocol check, as `benchmarks/duplex/serving.py` scores a session. `report` lists the runs it skipped.
 
 ## SocialOmni
 
